@@ -1,0 +1,34 @@
+name: Sinsta Name Hunter
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # Every 30 minutes
+  workflow_dispatch:
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run Hunter
+        run: |
+          python hunter.py
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "SinstaHunterBot"
+          git config --global user.email "bot@sinstahunter.com"
+          git add state.json available_usernames.txt || echo "No available usernames to commit"
+          git commit -m "Update Sinsta Hunt state and available usernames [skip ci]" || echo "No changes to commit"
+          git push
