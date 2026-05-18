@@ -41,7 +41,6 @@ def load_usernames():
     return usernames
 
 def log_available_username(username, reason):
-    # Append the available name immediately to available_usernames.txt
     try:
         with open(AVAILABLE_FILE, "a") as f:
             f.write(f"{username}\n")
@@ -57,52 +56,87 @@ def check_availability(username):
     }
     
     try:
-        # Step 1: URL HTTP GET Probe (Checks if profile exists in real-time)
+        # Step 1: URL HTTP GET Probe
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             return False, "Taken (Profile active)"
-        
-        # Step 2: Strict Signup API Check (Handles deactivated, banned, restricted, and shadowbanned accounts)
-        api_url = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
-        session = requests.Session()
-        session.get("https://www.instagram.com/accounts/emailsignup/", headers=headers, timeout=10)
-        
-        api_headers = {
-            "User-Agent": headers["User-Agent"],
-            "X-IG-App-ID": "936619743392459",
-            "X-ASBD-ID": "129477",
-            "X-CSRFToken": session.cookies.get("csrftoken", "missing"),
-            "Referer": "https://www.instagram.com/accounts/emailsignup/",
-            "X-Requested-With": "XMLHttpRequest"
-        }
-        
-        data = {
-            "email": f"sinsta_{int(time.time())}@gmail.com",
-            "username": username,
-            "first_name": "Sinsta",
-            "opt_into_hashtags": "false"
-        }
-        
-        api_resp = session.post(api_url, data=data, headers=api_headers, timeout=10)
-        result = api_resp.json()
-        
-        # Parse API Response
-        if "errors" in result and result["errors"]:
-            # If the Signup validation API returned errors (e.g. username_is_taken or restricted)
-            errors = result["errors"]
-            # Extract readable message if possible
-            error_msg = "Taken / Deactivated"
-            if "username" in errors:
-                error_msg = errors["username"][0].get("message", "Taken")
-            return False, f"Not Registerable ({error_msg})"
-            
-        if result.get("status") != "ok":
-            return False, f"Not Registerable (Status: {result.get('status')})"
-            
-        return True, "Available (Truly Registerable)"
             
     except Exception as e:
-        return False, f"Connection/Parsing Error: {str(e)}"
+        return False, f"Connection Error (GET): {str(e)}"
+        
+    # Step 2: Strict Signup API Check with Retries for rate limiting
+    api_url = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
+    max_retries = 3
+    retry_delay = 10
+    
+    for attempt in range(max_retries):
+        try:
+            session = requests.Session()
+            session.get("https://www.instagram.com/accounts/emailsignup/", headers=headers, timeout=10)
+            
+            api_headers = {
+                "User-Agent": headers["User-Agent"],
+                "X-IG-App-ID": "936619743392459",
+                "X-ASBD-ID": "129477",
+                "X-CSRFToken": session.cookies.get("csrftoken", "missing"),
+                "Referer": "https://www.instagram.com/accounts/emailsignup/",
+                "X-Requested-With": "XMLHttpRequest"
+            }
+            
+            data = {
+                "email": f"sinsta_{int(time.time())}@gmail.com",
+                "username": username,
+                "first_name": "Sinsta",
+                "opt_into_hashtags": "false"
+            }
+            
+            api_resp = session.post(api_url, data=data, headers=api_headers, timeout=10)
+            
+            # Handle rate limiting or blocking
+            if api_resp.status_code == 429:
+                print(f"[Rate Limited (429) on {username}, retrying in {retry_delay}s...]", end="", flush=True)
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+                
+            if api_resp.status_code != 200:
+                # If we get a bad status code, it's highly likely a temporary block or a rate limit
+                # We will wait and retry
+                print(f"[HTTP {api_resp.status_code} on {username}, retrying in {retry_delay}s...]", end="", flush=True)
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            
+            try:
+                result = api_resp.json()
+            except Exception:
+                # If it's not JSON, Instagram probably redirected us to a login page or error block page
+                print(f"[Bad JSON Response on {username}, retrying in {retry_delay}s...]", end="", flush=True)
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            
+            # Parse API Response
+            if "errors" in result and result["errors"]:
+                errors = result["errors"]
+                error_msg = "Taken / Deactivated"
+                if "username" in errors:
+                    error_msg = errors["username"][0].get("message", "Taken")
+                return False, f"Not Registerable ({error_msg})"
+                
+            if result.get("status") != "ok":
+                return False, f"Not Registerable (Status: {result.get('status')})"
+                
+            return True, "Available (Truly Registerable)"
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                return False, f"API Connection/Parsing Error: {str(e)}"
+            time.sleep(retry_delay)
+            retry_delay *= 2
+            
+    # If all retries failed, log it as an error to allow manual check or skip
+    return False, "Rate Limited / Connection Blocked"
 
 def run_batch():
     state = load_state()
@@ -126,7 +160,6 @@ def run_batch():
     taken_count = 0
     error_count = 0
     
-    # Clean/Reset available file if we are starting a completely fresh run
     if start_idx == 0 and os.path.exists(AVAILABLE_FILE):
         try:
             os.remove(AVAILABLE_FILE)
@@ -144,7 +177,7 @@ def run_batch():
             log_available_username(username, reason)
         else:
             print(f"TAKEN ({reason})")
-            if "Error" in reason:
+            if "Error" in reason or "Limited" in reason or "Blocked" in reason:
                 error_count += 1
             else:
                 taken_count += 1
@@ -152,15 +185,12 @@ def run_batch():
         checked_count += 1
         current_idx += 1
         
-        # Realtime progress write-back to ensure we never lose state if action is aborted
         state["last_checked_index"] = current_idx - 1
         save_state(state)
         
-        # Safe delay to prevent WAF rate limits
         if checked_count < BATCH_SIZE and current_idx < total_names:
             time.sleep(SAFE_DELAY)
             
-    # Output the beautiful, highly-visible final summary
     print("\n" + "=" * 60)
     print("SINSTA RUN COMPLETED SUMMARY")
     print("=" * 60)
